@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import contextlib
+import functools
+import os
 import tempfile
 
 from spack.package import *
@@ -57,7 +59,7 @@ class Postgis(AutotoolsPackage):
 
     def patch(self):
         # https://trac.osgeo.org/postgis/ticket/4833
-        if self.spec.satisfies("@:3.1.1 ^proj@6:"):
+        if self.spec.satisfies("@:3.1.1 ^proj@8:"):
             filter_file(r"\bpj_get_release\b", "proj_info", "configure")
 
     def setup_build_environment(self, env):
@@ -82,39 +84,16 @@ class Postgis(AutotoolsPackage):
             args.append("--with-gui")
         return args
 
-    @run_after("build")
-    @on_package_attributes(run_tests=True)
     def check(self):
-        with self.postgresql():
-            make("check")
+        with self.postgresql() as psql:
+            host = psql("-c", r"\echo :HOST", "-t", "postgres", output=str)
+            make("check", f"PGHOST={host.strip()}")
 
-    # By default package installs under postgresql prefix.
-    # Apparently this is a known bug:
-    # https://postgis.net/docs/postgis_installation.html
-    # The following modifacations that fixed this issue are found in
-    # Guix recipe for postgis.
-    # https://git.savannah.gnu.org/cgit/guix.git/tree/gnu/packages/geo.scm#n720
-
-    def install(self, spec, prefix):
-        make(
-            "install",
-            "bindir=" + prefix.bin,
-            "libdir=" + prefix.lib,
-            "pkglibdir=" + prefix.lib,
-            "datadir=" + prefix.share,
-            "docdir=" + prefix.share.doc,
-        )
-
-        copy(
-            prefix.share.extension.join("postgis.control"),
-            spec["postgresql"].prefix.share.extension,
-        )
-        filter_file(
-            "$libdir",
-            prefix.lib,
-            spec["postgresql"].prefix.share.extension.join("postgis.control"),
-            string=True,
-        )
+    @run_after("install")
+    def satisfy_sanity_check(self):
+        # sanity_check_prefix requires something in the install directory,
+        # but PostGIS is installed in PostgreSQL's install directory.
+        os.symlink(self.spec["postgresql"].prefix, self.prefix.postgresql)
 
     def test_lib_version(self):
         """Makes sure the PostGIS extension is usable from PostgreSQL."""
@@ -126,20 +105,12 @@ class Postgis(AutotoolsPackage):
     @contextlib.contextmanager
     def postgresql(self):
         postgresql_bin_dir = self.spec["postgresql"].prefix.bin
-        initdb = which(postgresql_bin_dir.join("initdb"))
         pg_ctl = which(postgresql_bin_dir.join("pg_ctl"))
         with tempfile.TemporaryDirectory() as data_dir:
-            initdb("-A", "trust", "-D", data_dir)
-            pg_ctl("-D", data_dir, "start")
+            pg_ctl("init", "-D", data_dir, "-o", "-A trust")
+            pg_ctl("start", "-D", data_dir, "-o", f"-h '' -k {data_dir}")
             try:
                 psql = which(postgresql_bin_dir.join("psql"))
-                yield psql
+                yield functools.partial(psql, "-h", data_dir)
             finally:
-                pg_ctl("-D", data_dir, "stop")
-
-    @run_before("build")
-    def fix_raster_bindir(self):
-        makefile = FileFilter("raster/loader/Makefile")
-        makefile.filter("$(DESTDIR)$(PGSQL_BINDIR)", self.prefix.bin, string=True)
-        makefile = FileFilter("raster/scripts/Makefile")
-        makefile.filter("$(DESTDIR)$(PGSQL_BINDIR)", self.prefix.bin, string=True)
+                pg_ctl("stop", "-D", data_dir)
